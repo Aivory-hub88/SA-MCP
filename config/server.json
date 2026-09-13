@@ -1,0 +1,5 @@
+{
+  "serverName": "sa-mcp",
+  "protocolVersion": "2025-11-05",
+  "instructions": "SAP MCP (Rust) over OData V2/V4 for S/4HANA. Pattern: sap_discover -> sap_entity_metadata -> sap_read/read_one. Writes are gated: preview_write -> validate_write -> execute_approved_write with confirm=true and SAP_MCP_ENABLE_WRITES=1. Compatible with Python MCP clients over stdio, streamable-HTTP (/mcp), SSE (/sse + POST /messages), and WebSocket."
+}

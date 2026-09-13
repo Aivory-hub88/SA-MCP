@@ -1,0 +1,25 @@
+{
+  "default": "s4prod",
+  "instances": {
+    "s4prod": {
+      "url": "https://s4.example.com",
+      "client": "100",
+      "auth_type": "basic",
+      "username": "api_user",
+      "password": "xxx",
+      "odata_version": "v2",
+      "service": "/sap/opu/odata/sap/API_BUSINESS_PARTNER",
+      "mcpToken": "tenant-s4-token"
+    },
+    "s4cloud": {
+      "url": "https://mytenant.s4hana.cloud.sap",
+      "auth_type": "oauth2",
+      "oauth_token_url": "https://mytenant.authentication.eu10.hana.ondemand.com/oauth/token",
+      "oauth_client_id": "xxx",
+      "oauth_client_secret": "xxx",
+      "odata_version": "v4",
+      "service": "/sap/opu/odata4/sap/api_business_partner/srvd_a2x/sap/businesspartner/0001",
+      "mcpToken": ["tenant-cloud-token"]
+    }
+  }
+}

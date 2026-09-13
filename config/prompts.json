@@ -1,0 +1,14 @@
+{
+  "prompts": [
+    {
+      "name": "sap_odata_basics",
+      "description": "OData query cheat-sheet for SAP",
+      "content": "Query pattern: sap_discover (find entity) -> sap_entity_metadata (keys/properties) -> sap_read with $filter (e.g. \"BusinessPartnerID eq '1000001'\"), $select, $orderby, $top. Single read via sap_read_one with keys object. Writes always gated: preview -> validate -> execute with confirm=true."
+    },
+    {
+      "name": "safe_write_review",
+      "description": "Review a proposed SAP write before executing",
+      "content": "Flow: 1) sap_preview_write 2) sap_validate_write (fix unknown_property / keys_required / not_creatable issues) 3) sap_execute_approved_write with confirm=true. Requires SAP_MCP_ENABLE_WRITES=1. Tokens single-use, TTL 600s, instance-bound. Updates send If-Match * unless an ETag is passed."
+    }
+  ]
+}

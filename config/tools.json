@@ -1,0 +1,452 @@
+{
+  "tools": [
+    {
+      "name": "sap_list_instances",
+      "description": "List configured SAP systems (no credentials). Tenant-filtered.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {}
+      },
+      "op": {
+        "type": "list_instances",
+        "map": {}
+      },
+      "group": "read"
+    },
+    {
+      "name": "sap_discover",
+      "description": "L1: list entity sets from $metadata (cached). Filter with query substring.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "instance": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "query": {
+            "type": "string"
+          }
+        }
+      },
+      "op": {
+        "type": "discover",
+        "map": {
+          "instance": "/instance",
+          "service": "/service",
+          "query": "/query"
+        }
+      },
+      "group": "read"
+    },
+    {
+      "name": "sap_entity_metadata",
+      "description": "L2: full properties/keys/capabilities for one entity set (cached).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "instance": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "entity": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "entity"
+        ]
+      },
+      "op": {
+        "type": "entity_metadata",
+        "map": {
+          "instance": "/instance",
+          "service": "/service",
+          "entity": "/entity"
+        }
+      },
+      "group": "read"
+    },
+    {
+      "name": "sap_read",
+      "description": "L3: query an entity set ($filter/$select/$expand/$orderby/$top/$skip/$count).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "instance": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "entity": {
+            "type": "string"
+          },
+          "filter": {
+            "type": "string"
+          },
+          "select": {
+            "type": "string"
+          },
+          "expand": {
+            "type": "string"
+          },
+          "orderby": {
+            "type": "string"
+          },
+          "top": {
+            "type": "number"
+          },
+          "skip": {
+            "type": "number"
+          },
+          "count": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "entity"
+        ]
+      },
+      "op": {
+        "type": "read",
+        "map": {
+          "instance": "/instance",
+          "service": "/service",
+          "entity": "/entity",
+          "filter": "/filter",
+          "select": "/select",
+          "expand": "/expand",
+          "orderby": "/orderby",
+          "top": "/top",
+          "skip": "/skip",
+          "count": "/count"
+        }
+      },
+      "group": "read"
+    },
+    {
+      "name": "sap_read_one",
+      "description": "L3: read a single entity by key, e.g. keys {BusinessPartner: '1000001'}.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "instance": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "entity": {
+            "type": "string"
+          },
+          "keys": {
+            "type": "object"
+          },
+          "select": {
+            "type": "string"
+          },
+          "expand": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "entity",
+          "keys"
+        ]
+      },
+      "op": {
+        "type": "read_one",
+        "map": {
+          "instance": "/instance",
+          "service": "/service",
+          "entity": "/entity",
+          "keys": "/keys",
+          "select": "/select",
+          "expand": "/expand"
+        }
+      },
+      "group": "read"
+    },
+    {
+      "name": "sap_preview_write",
+      "description": "Step 1/3 gated write: build non-executing approval payload. Always start here.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "instance": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "entity": {
+            "type": "string"
+          },
+          "operation": {
+            "type": "string"
+          },
+          "keys": {
+            "type": "object"
+          },
+          "values": {
+            "type": "object"
+          },
+          "etag": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "entity",
+          "operation"
+        ]
+      },
+      "op": {
+        "type": "preview_write",
+        "map": {
+          "instance": "/instance",
+          "service": "/service",
+          "entity": "/entity",
+          "operation": "/operation",
+          "keys": "/keys",
+          "values": "/values",
+          "etag": "/etag"
+        }
+      },
+      "group": "write"
+    },
+    {
+      "name": "sap_validate_write",
+      "description": "Step 2/3 gated write: validate against live $metadata, store single-use token (TTL 600s).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "instance": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "entity": {
+            "type": "string"
+          },
+          "operation": {
+            "type": "string"
+          },
+          "keys": {
+            "type": "object"
+          },
+          "values": {
+            "type": "object"
+          },
+          "etag": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "entity",
+          "operation"
+        ]
+      },
+      "op": {
+        "type": "validate_write",
+        "map": {
+          "instance": "/instance",
+          "service": "/service",
+          "entity": "/entity",
+          "operation": "/operation",
+          "keys": "/keys",
+          "values": "/values",
+          "etag": "/etag"
+        }
+      },
+      "group": "write"
+    },
+    {
+      "name": "sap_execute_approved_write",
+      "description": "Step 3/3 gated write: execute validated token. Requires SAP_MCP_ENABLE_WRITES=1 and confirm=true.",
+      "guards": {
+        "requiresEnvTrue": "SAP_MCP_ENABLE_WRITES"
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "approval": {
+            "type": "object"
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "approval",
+          "confirm"
+        ]
+      },
+      "op": {
+        "type": "execute_approved_write",
+        "map": {
+          "approval": "/approval",
+          "confirm": "/confirm"
+        }
+      },
+      "group": "write"
+    },
+    {
+      "name": "sap_create",
+      "description": "Gated create. Requires approval token from validate_write + confirm=true + SAP_MCP_ENABLE_WRITES=1.",
+      "guards": {
+        "requiresEnvTrue": "SAP_MCP_ENABLE_WRITES"
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "instance": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "entity": {
+            "type": "string"
+          },
+          "values": {
+            "type": "object"
+          },
+          "approval": {
+            "type": "object"
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "entity",
+          "values",
+          "approval",
+          "confirm"
+        ]
+      },
+      "op": {
+        "type": "create",
+        "map": {
+          "instance": "/instance",
+          "service": "/service",
+          "entity": "/entity",
+          "values": "/values",
+          "approval": "/approval",
+          "confirm": "/confirm"
+        }
+      },
+      "group": "write"
+    },
+    {
+      "name": "sap_update",
+      "description": "Gated update (MERGE/PATCH, If-Match * or ETag). Requires approval token + confirm=true.",
+      "guards": {
+        "requiresEnvTrue": "SAP_MCP_ENABLE_WRITES"
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "instance": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "entity": {
+            "type": "string"
+          },
+          "keys": {
+            "type": "object"
+          },
+          "values": {
+            "type": "object"
+          },
+          "etag": {
+            "type": "string"
+          },
+          "approval": {
+            "type": "object"
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "entity",
+          "keys",
+          "values",
+          "approval",
+          "confirm"
+        ]
+      },
+      "op": {
+        "type": "update",
+        "map": {
+          "instance": "/instance",
+          "service": "/service",
+          "entity": "/entity",
+          "keys": "/keys",
+          "values": "/values",
+          "etag": "/etag",
+          "approval": "/approval",
+          "confirm": "/confirm"
+        }
+      },
+      "group": "write"
+    },
+    {
+      "name": "sap_delete",
+      "description": "Gated delete. Requires approval token + confirm=true.",
+      "guards": {
+        "requiresEnvTrue": "SAP_MCP_ENABLE_WRITES"
+      },
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "instance": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          },
+          "entity": {
+            "type": "string"
+          },
+          "keys": {
+            "type": "object"
+          },
+          "approval": {
+            "type": "object"
+          },
+          "confirm": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "entity",
+          "keys",
+          "approval",
+          "confirm"
+        ]
+      },
+      "op": {
+        "type": "delete",
+        "map": {
+          "instance": "/instance",
+          "service": "/service",
+          "entity": "/entity",
+          "keys": "/keys",
+          "approval": "/approval",
+          "confirm": "/confirm"
+        }
+      },
+      "group": "write"
+    }
+  ]
+}

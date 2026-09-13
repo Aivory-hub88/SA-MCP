@@ -1,0 +1,35 @@
+[package]
+name = "sa-mcp"
+version = "0.1.0"
+edition = "2021"
+description = "SAP MCP Server (Rust) - OData V2/V4 for S/4HANA. stdio, streamable-HTTP, SSE, WebSocket + gated-write + multi-tenant isolation."
+license = "MIT"
+
+[[bin]]
+name = "sa-mcp"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["ws", "json"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.6", features = ["cors", "set-header", "limit"] }
+tokio-tungstenite = "0.26"
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures = "0.3"
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = { version = "0.36", features = ["serialize"] }
+http = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+hex = "0.4"
+chrono = "0.4"
+anyhow = "1"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
