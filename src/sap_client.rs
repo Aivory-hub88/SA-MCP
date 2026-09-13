@@ -46,21 +46,24 @@ impl SapClient {
             "oauth2" => {
                 {
                     let g = self.oauth.lock().unwrap();
-                    if let Some((tok, at)) = g.clone() {
-                        if at.elapsed() < Duration::from_secs(50 * 60) {
+                    if let Some((tok, exp)) = g.clone() {
+                        if Instant::now() < exp {
                             return Ok(Some(tok));
                         }
                     }
                 }
-                let tok = self.fetch_oauth_token().await?;
-                *self.oauth.lock().unwrap() = Some((tok.clone(), Instant::now()));
+                let (tok, ttl) = self.fetch_oauth_token().await?;
+                // Honor provider expires_in minus 60s skew (default 1h).
+                let exp = Instant::now() + Duration::from_secs(ttl.saturating_sub(60).max(60));
+                *self.oauth.lock().unwrap() = Some((tok.clone(), exp));
                 Ok(Some(tok))
             }
             _ => Ok(None),
         }
     }
 
-    async fn fetch_oauth_token(&self) -> Result<String> {
+    /// Returns (token, expires_in_secs) honoring the provider value.
+    async fn fetch_oauth_token(&self) -> Result<(String, u64)> {
         let url = self.cfg.oauth_token_url.clone().unwrap_or_default();
         let mut form = vec![
             ("grant_type", "client_credentials".to_string()),
@@ -75,10 +78,13 @@ impl SapClient {
             return Err(anyhow!("oauth token http {}", resp.status()));
         }
         let v: Value = resp.json().await.context("parse oauth token")?;
-        v.get("access_token")
+        let tok = v
+            .get("access_token")
             .and_then(|t| t.as_str())
             .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("oauth response has no access_token"))
+            .ok_or_else(|| anyhow!("oauth response has no access_token"))?;
+        let ttl = v.get("expires_in").and_then(|e| e.as_u64()).unwrap_or(3600);
+        Ok((tok, ttl))
     }
 
     fn basic_header(&self) -> Option<String> {
@@ -98,32 +104,9 @@ impl SapClient {
 
     /// Append sap-client + $format=json (V2) to a URL.
     fn url_with_params(&self, base: &str, extra: &[(&str, &str)]) -> String {
-        let mut q: Vec<(String, String)> = vec![];
-        if let Some(c) = &self.cfg.client {
-            if !c.trim().is_empty() {
-                q.push(("sap-client".into(), c.clone()));
-            }
-        }
-        if !self.is_v4() {
-            q.push(("$format".into(), "json".into()));
-        }
-        for (k, v) in extra {
-            q.push((k.to_string(), v.to_string()));
-        }
-        if q.is_empty() {
-            return base.to_string();
-        }
-        let qs: Vec<String> = q
-            .iter()
-            .map(|(k, v)| {
-                format!(
-                    "{}={}",
-                    url_encode(k),
-                    url_encode(v)
-                )
-            })
-            .collect();
-        format!("{}?{}", base, qs.join("&"))
+        let owned: Vec<(String, String)> =
+            extra.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        self.url_with_params_owned(base, &owned)
     }
 
     async fn send(
@@ -273,6 +256,9 @@ impl SapClient {
             q.push((k.clone(), v.clone()));
         }
         let qs: Vec<String> = q.iter().map(|(k, v)| format!("{}={}", url_encode(k), url_encode(v))).collect();
+        if qs.is_empty() {
+            return base.to_string();
+        }
         format!("{base}?{qs}", qs = qs.join("&"))
     }
 
@@ -312,19 +298,28 @@ impl SapClient {
             return Err(anyhow!("invalid entity set '{entity_set}'"));
         }
         let root = self.cfg.service_root(service)?;
-        let csrf = self.csrf_token(&root).await?;
-        let mut headers = vec![];
-        if !csrf.is_empty() {
-            headers.push(("X-CSRF-Token".into(), csrf));
-        }
         let url = self.url_with_params(&format!("{root}/{entity_set}"), &[]);
-        let resp = self.send(reqwest::Method::POST, url, Some(body), headers, false).await?;
-        let status = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
-        if !(status.is_success() || status.as_u16() == 201) {
-            return Err(anyhow!(Self::odata_error(&txt)));
+        // A 403 here proves non-execution, so one CSRF refresh + retry is safe
+        // (writes themselves are still never retried on transport errors).
+        for attempt in 0..2 {
+            let csrf = self.csrf_token(&root).await?;
+            let mut headers = vec![];
+            if !csrf.is_empty() {
+                headers.push(("X-CSRF-Token".into(), csrf));
+            }
+            let resp = self.send(reqwest::Method::POST, url.clone(), Some(body.clone()), headers, false).await?;
+            let status = resp.status();
+            if status.as_u16() == 403 && attempt == 0 && !self.is_v4() {
+                *self.csrf.lock().unwrap() = None;
+                continue;
+            }
+            let txt = resp.text().await.unwrap_or_default();
+            if !(status.is_success() || status.as_u16() == 201) {
+                return Err(anyhow!(Self::odata_error(&txt)));
+            }
+            return Ok(serde_json::from_str(&txt).unwrap_or(json!({"success": true})));
         }
-        Ok(serde_json::from_str(&txt).unwrap_or(json!({"success": true})))
+        Err(anyhow!("CSRF refresh retry exhausted"))
     }
 
     pub async fn update(
@@ -339,20 +334,29 @@ impl SapClient {
             return Err(anyhow!("invalid entity set '{entity_set}'"));
         }
         let root = self.cfg.service_root(service)?;
-        let csrf = self.csrf_token(&root).await?;
-        let mut headers = vec![("If-Match".into(), etag.unwrap_or_else(|| "*".into()))];
-        if !csrf.is_empty() {
-            headers.push(("X-CSRF-Token".into(), csrf));
-        }
         let url = self.url_with_params(&format!("{root}/{entity_set}({key_segment})"), &[]);
-        let method = if self.is_v4() { reqwest::Method::PATCH } else { reqwest::Method::from_bytes(b"MERGE").unwrap_or(reqwest::Method::PUT) };
-        let resp = self.send(method, url, Some(body), headers, false).await?;
-        let status = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
-        if !(status.is_success() || status.as_u16() == 204) {
-            return Err(anyhow!(Self::odata_error(&txt)));
+        // V2 partial update = MERGE (PUT would replace the whole entity);
+        // V4 = PATCH. MERGE is a static valid token, safe to expect().
+        let method = if self.is_v4() { reqwest::Method::PATCH } else { reqwest::Method::from_bytes(b"MERGE").expect("static method") };
+        for attempt in 0..2 {
+            let csrf = self.csrf_token(&root).await?;
+            let mut headers = vec![("If-Match".into(), etag.clone().unwrap_or_else(|| "*".into()))];
+            if !csrf.is_empty() {
+                headers.push(("X-CSRF-Token".into(), csrf));
+            }
+            let resp = self.send(method.clone(), url.clone(), Some(body.clone()), headers, false).await?;
+            let status = resp.status();
+            if status.as_u16() == 403 && attempt == 0 && !self.is_v4() {
+                *self.csrf.lock().unwrap() = None;
+                continue;
+            }
+            let txt = resp.text().await.unwrap_or_default();
+            if !(status.is_success() || status.as_u16() == 204) {
+                return Err(anyhow!(Self::odata_error(&txt)));
+            }
+            return Ok(json!({"success": true}));
         }
-        Ok(json!({"success": true}))
+        Err(anyhow!("CSRF refresh retry exhausted"))
     }
 
     pub async fn delete(&self, service: Option<&str>, entity_set: &str, key_segment: &str, etag: Option<String>) -> Result<Value> {
@@ -360,19 +364,26 @@ impl SapClient {
             return Err(anyhow!("invalid entity set '{entity_set}'"));
         }
         let root = self.cfg.service_root(service)?;
-        let csrf = self.csrf_token(&root).await?;
-        let mut headers = vec![("If-Match".into(), etag.unwrap_or_else(|| "*".into()))];
-        if !csrf.is_empty() {
-            headers.push(("X-CSRF-Token".into(), csrf));
-        }
         let url = self.url_with_params(&format!("{root}/{entity_set}({key_segment})"), &[]);
-        let resp = self.send(reqwest::Method::DELETE, url, None, headers, false).await?;
-        let status = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
-        if !(status.is_success() || status.as_u16() == 204) {
-            return Err(anyhow!(Self::odata_error(&txt)));
+        for attempt in 0..2 {
+            let csrf = self.csrf_token(&root).await?;
+            let mut headers = vec![("If-Match".into(), etag.clone().unwrap_or_else(|| "*".into()))];
+            if !csrf.is_empty() {
+                headers.push(("X-CSRF-Token".into(), csrf));
+            }
+            let resp = self.send(reqwest::Method::DELETE, url.clone(), None, headers, false).await?;
+            let status = resp.status();
+            if status.as_u16() == 403 && attempt == 0 && !self.is_v4() {
+                *self.csrf.lock().unwrap() = None;
+                continue;
+            }
+            let txt = resp.text().await.unwrap_or_default();
+            if !(status.is_success() || status.as_u16() == 204) {
+                return Err(anyhow!(Self::odata_error(&txt)));
+            }
+            return Ok(json!({"success": true}));
         }
-        Ok(json!({"success": true}))
+        Err(anyhow!("CSRF refresh retry exhausted"))
     }
 
     pub async fn health_check(&self) -> bool {
@@ -416,7 +427,9 @@ fn url_encode(s: &str) -> String {
 /// {"records": [...], "count": n, "total": t?}.
 fn normalize_collection(v: &Value) -> Value {
     if let Some(arr) = v.pointer("/d/results").and_then(|x| x.as_array()) {
-        let total = v.pointer("/d/__count").and_then(|x| x.as_str()).and_then(|s| s.parse::<i64>().ok());
+        let total = v
+            .pointer("/d/__count")
+            .and_then(|x| x.as_str().and_then(|s| s.parse::<i64>().ok()).or_else(|| x.as_i64()));
         let mut out = json!({"records": arr, "count": arr.len()});
         if let Some(t) = total {
             out["total"] = json!(t);
@@ -451,12 +464,17 @@ pub fn parse_edmx(xml: &str) -> Result<Value> {
     let mut cur_keys: Vec<String> = vec![];
     let mut cur_base: Option<String> = None;
     let mut in_key = false;
+    let mut in_complex = false;
+    let decoder = reader.decoder();
 
     let attr = |e: &quick_xml::events::BytesStart, name: &[u8]| -> Option<String> {
         e.attributes().find_map(|a| {
             a.ok().and_then(|a| {
                 if a.key.as_ref() == name {
-                    Some(String::from_utf8_lossy(&a.value).into_owned())
+                    // Decode XML entities (&amp; etc.) — raw bytes would leak them.
+                    a.decode_and_unescape_value(decoder.clone())
+                        .ok()
+                        .map(|v| v.into_owned())
                 } else {
                     None
                 }
@@ -472,62 +490,91 @@ pub fn parse_edmx(xml: &str) -> Result<Value> {
         None
     };
 
+    // Shared element handling for both <X> (Start) and <X/> (Empty).
+    // Self-closing <EntityType/> is finalized immediately so no state leaks.
+    let mut handle_open = |e: &quick_xml::events::BytesStart,
+                           self_closing: bool,
+                           sets: &mut Vec<Value>,
+                           types: &mut serde_json::Map<String, Value>,
+                           cur_type: &mut Option<String>,
+                           cur_props: &mut Vec<Value>,
+                           cur_keys: &mut Vec<String>,
+                           cur_base: &mut Option<String>,
+                           in_key: &mut bool,
+                           in_complex: &mut bool| {
+        let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
+        let local = name.rsplit(':').next().unwrap_or(&name);
+        match local {
+            "ComplexType" => *in_complex = true,
+            "EntitySet" => {
+                if let Some(n) = attr(e, b"Name") {
+                    let et = attr(e, b"EntityType").unwrap_or_default();
+                    let flag = |k: &str| attr_any(e, &[k, &format!("sap:{k}")]).map(|v| v == "true").unwrap_or(false);
+                    sets.push(json!({
+                        "name": n,
+                        "entity_type": et.rsplit('.').next().unwrap_or(&et),
+                        "creatable": flag("creatable"),
+                        "updatable": flag("updatable"),
+                        "deletable": flag("deletable"),
+                        "addressable": attr_any(e, &["addressable", "sap:addressable"]).map(|v| v != "false").unwrap_or(true),
+                    }));
+                }
+            }
+            "EntityType" => {
+                if let Some(n) = attr(e, b"Name") {
+                    if self_closing {
+                        let mut obj = json!({"properties": [], "keys": []});
+                        if let Some(b) = attr(e, b"BaseType") {
+                            obj["base_type"] = json!(b.rsplit('.').next().unwrap_or(&b));
+                        }
+                        types.insert(n, obj);
+                    } else {
+                        *cur_type = Some(n);
+                        cur_props.clear();
+                        cur_keys.clear();
+                        *cur_base = attr(e, b"BaseType");
+                    }
+                }
+            }
+            "Key" => *in_key = true,
+            "PropertyRef" => {
+                if *in_key {
+                    if let Some(n) = attr(e, b"Name") {
+                        cur_keys.push(n);
+                    }
+                }
+            }
+            "Property" => {
+                // ComplexType properties must not pollute the entity type.
+                if cur_type.is_some() && !*in_complex {
+                    if let Some(n) = attr(e, b"Name") {
+                        cur_props.push(json!({
+                            "name": n,
+                            "type": attr(e, b"Type").unwrap_or_default().rsplit('.').next().unwrap_or("").to_string(),
+                            "nullable": attr(e, b"Nullable").map(|v| v != "false").unwrap_or(true),
+                            "max_length": attr(e, b"MaxLength"),
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+    };
+
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Empty(e)) | Ok(Event::Start(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
-                let local = name.rsplit(':').next().unwrap_or(&name);
-                match local {
-                    "EntitySet" => {
-                        if let Some(n) = attr(&e, b"Name") {
-                            let et = attr(&e, b"EntityType").unwrap_or_default();
-                            let flag = |k: &str| attr_any(&e, &[k, &format!("sap:{k}")]).map(|v| v == "true").unwrap_or(false);
-                            sets.push(json!({
-                                "name": n,
-                                "entity_type": et.rsplit('.').next().unwrap_or(&et),
-                                "creatable": flag("creatable"),
-                                "updatable": flag("updatable"),
-                                "deletable": flag("deletable"),
-                                "addressable": attr_any(&e, &["addressable", "sap:addressable"]).map(|v| v != "false").unwrap_or(true),
-                            }));
-                        }
-                    }
-                    "EntityType" => {
-                        if let Some(n) = attr(&e, b"Name") {
-                            cur_type = Some(n);
-                            cur_props = vec![];
-                            cur_keys = vec![];
-                            cur_base = attr(&e, b"BaseType");
-                        }
-                    }
-                    "Key" => in_key = true,
-                    "PropertyRef" => {
-                        if in_key {
-                            if let Some(n) = attr(&e, b"Name") {
-                                cur_keys.push(n);
-                            }
-                        }
-                    }
-                    "Property" => {
-                        if cur_type.is_some() {
-                            if let Some(n) = attr(&e, b"Name") {
-                                cur_props.push(json!({
-                                    "name": n,
-                                    "type": attr(&e, b"Type").unwrap_or_default().rsplit('.').next().unwrap_or("").to_string(),
-                                    "nullable": attr(&e, b"Nullable").map(|v| v != "false").unwrap_or(true),
-                                    "max_length": attr(&e, b"MaxLength"),
-                                }));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+            Ok(Event::Empty(e)) => {
+                handle_open(&e, true, &mut sets, &mut types, &mut cur_type, &mut cur_props, &mut cur_keys, &mut cur_base, &mut in_key, &mut in_complex);
+            }
+            Ok(Event::Start(e)) => {
+                handle_open(&e, false, &mut sets, &mut types, &mut cur_type, &mut cur_props, &mut cur_keys, &mut cur_base, &mut in_key, &mut in_complex);
             }
             Ok(Event::End(e)) => {
                 let name = String::from_utf8_lossy(e.name().as_ref()).into_owned();
                 let local = name.rsplit(':').next().unwrap_or(&name);
                 match local {
                     "Key" => in_key = false,
+                    "ComplexType" => in_complex = false,
                     "EntityType" => {
                         if let Some(t) = cur_type.take() {
                             let mut obj = json!({"properties": cur_props, "keys": cur_keys});

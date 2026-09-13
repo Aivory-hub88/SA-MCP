@@ -183,7 +183,7 @@ fn policy_file_path() -> Option<String> {
         }
     }
     // default location if present
-    for cand in ["./odoo_mcp_policy.json", "./field_acl.json", "config/field_acl.json"] {
+    for cand in ["./sap_mcp_policy.json", "./field_acl.json", "config/field_acl.json"] {
         if std::path::Path::new(cand).exists() {
             return Some(cand.to_string());
         }

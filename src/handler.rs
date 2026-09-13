@@ -128,15 +128,33 @@ impl Handler {
         let inst = tenant
             .resource_default(self.pool.default_name())
             .ok_or_else(|| "tenant has no accessible instances".to_string())?;
+        // Resources share the choke-point rules: tenant scope (above),
+        // entity allow/deny + rate accounting (below).
+        let (rate_ok, _) = self.limiter.check(tenant.id(), &inst, "resources/read");
+        if !rate_ok {
+            return Err("rate limited".to_string());
+        }
         let c = self.pool.get(&inst).map_err(|e| e.to_string())?;
         if uri == "sap://entities" {
             let md = self.cached_metadata(&c, &inst, None).await.map_err(|e| e.to_string())?;
-            let sets = md.get("entity_sets").cloned().unwrap_or(json!([]));
-            return Ok(json!({"contents":[{"uri":uri,"text": sets.to_string()}]}));
+            let sets: Vec<Value> = md
+                .get("entity_sets")
+                .and_then(|s| s.as_array())
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|s| {
+                    s.get("name").and_then(|n| n.as_str()).map(|n| crate::config::entity_allowed(n)).unwrap_or(false)
+                })
+                .collect();
+            return Ok(json!({"contents":[{"uri":uri,"text": Value::Array(sets).to_string()}]}));
         }
         if let Some(es) = uri.strip_prefix("sap://entity/") {
             if !crate::config::valid_odata_name(es) {
                 return Err("invalid entity name".to_string());
+            }
+            if !crate::config::entity_allowed(es) {
+                return Err(format!("entity '{es}' blocked by SAP_ENTITY_ALLOW/SAP_ENTITY_DENY"));
             }
             let md = self.cached_metadata(&c, &inst, None).await.map_err(|e| e.to_string())?;
             let annotated = Self::annotate_acl(&self.acl, &inst, es, entity_meta(&md, es));
@@ -267,8 +285,10 @@ impl Handler {
                     .unwrap_or_default()
                     .into_iter()
                     .filter(|s| {
-                        q.is_empty()
-                            || s.get("name").and_then(|n| n.as_str()).map(|n| n.to_lowercase().contains(&q)).unwrap_or(false)
+                        let name_ok = s.get("name").and_then(|n| n.as_str()).map(|n| crate::config::entity_allowed(n)).unwrap_or(false);
+                        let q_ok = q.is_empty()
+                            || s.get("name").and_then(|n| n.as_str()).map(|n| n.to_lowercase().contains(&q)).unwrap_or(false);
+                        name_ok && q_ok
                     })
                     .map(|mut s| {
                         // minimal footprint: name + capabilities only
@@ -345,6 +365,7 @@ impl Handler {
                     "keys": get("keys").unwrap_or(Value::Null),
                     "values": get("values").unwrap_or(Value::Null),
                     "etag": get("etag").unwrap_or(Value::Null),
+                    "auth_fp": auth_fp(args),
                 });
                 let token = build_approval_token(&payload);
                 audit("preview", tenant.id(), &instance, &entity, &operation, &token, true, "preview created");
@@ -369,6 +390,9 @@ impl Handler {
                     .map(|a| a.iter().filter_map(|x| x.get("name").and_then(|n| n.as_str()).map(|s| s.to_string())).collect())
                     .unwrap_or_default();
                 let values = get("values").unwrap_or(json!({}));
+                if (operation == "create" || operation == "update") && !values.is_object() {
+                    return Err(anyhow!("'values' must be an object for {operation}"));
+                }
                 let mut issues: Vec<Value> = vec![];
                 if let Some(obj) = values.as_object() {
                     for k in obj.keys() {
@@ -409,6 +433,7 @@ impl Handler {
                     "keys": get("keys").unwrap_or(Value::Null),
                     "values": get("values").unwrap_or(Value::Null),
                     "etag": get("etag").unwrap_or(Value::Null),
+                    "auth_fp": auth_fp(args),
                 });
                 let token = build_approval_token(&payload);
                 let hard_fail = issues.iter().any(|i| {
@@ -439,6 +464,14 @@ impl Handler {
                     audit("execute", tenant.id(), &payload_inst, "", "", token, false, "instance mismatch");
                     return Err(anyhow!("approval was issued for instance '{payload_inst}', not '{instance}'"));
                 }
+                // Credential-override binding: the executing call must present
+                // the same override (or none) as the validated call.
+                let fp_now = auth_fp(args);
+                let fp_was = payload.get("auth_fp").and_then(|s| s.as_str()).unwrap_or("none");
+                if fp_now != fp_was {
+                    audit("execute", tenant.id(), &payload_inst, "", "", token, false, "auth override mismatch");
+                    return Err(anyhow!("approval was validated with different SAP credentials"));
+                }
                 if !self.approvals.consume(token, &payload) {
                     let reason = if self.approvals.is_valid(token, &payload) {
                         "approval could not be consumed (concurrent use?)"
@@ -448,7 +481,7 @@ impl Handler {
                     audit("execute", tenant.id(), &payload_inst, "", "", token, false, reason);
                     return Err(anyhow!(reason.to_string()));
                 }
-                let res = self.exec_payload(&payload_inst, &payload).await?;
+                let res = self.exec_payload(&client, &payload_inst, &payload).await?;
                 let entity = payload.get("model").and_then(|s| s.as_str()).unwrap_or("");
                 let operation = payload.get("operation").and_then(|s| s.as_str()).unwrap_or("");
                 audit("execute", tenant.id(), &payload_inst, entity, operation, token, true, "ok");
@@ -471,13 +504,16 @@ impl Handler {
                 if p_inst != instance {
                     return Err(anyhow!("approval was issued for instance '{p_inst}', not '{instance}'"));
                 }
+                if payload.get("auth_fp").and_then(|s| s.as_str()).unwrap_or("none") != auth_fp(args) {
+                    return Err(anyhow!("approval was validated with different SAP credentials"));
+                }
                 let entity = req_entity("entity")?;
                 let p_entity = payload.get("model").and_then(|s| s.as_str()).unwrap_or("");
                 let p_op = payload.get("operation").and_then(|s| s.as_str()).unwrap_or("");
                 if p_entity != entity || p_op != op {
                     return Err(anyhow!("request does not match validated approval (entity/operation mismatch)"));
                 }
-                let res = self.exec_payload(&instance, &payload).await?;
+                let res = self.exec_payload(&client, &instance, &payload).await?;
                 audit("execute", tenant.id(), &instance, &entity, p_op, token, true, "ok (direct op)");
                 Ok(json!({"success": true, "result": res}))
             }
@@ -522,15 +558,25 @@ impl Handler {
         crate::sap_client::SapClient::new(cfg)
     }
 
-    /// Execute a validated payload (create/update/delete) on its instance.
-    async fn exec_payload(&self, instance: &str, payload: &Value) -> anyhow::Result<Value> {
-        let c = self.pool.get(instance)?;
+    /// Execute a validated payload with the EFFECTIVE client (honors the same
+    /// per-request override used at validate time; the approval binds the
+    /// override fingerprint, so creds can't be swapped between steps).
+    async fn exec_payload(
+        &self,
+        client: &crate::sap_client::SapClient,
+        instance: &str,
+        payload: &Value,
+    ) -> anyhow::Result<Value> {
+        // NOTE: uses the passed-in effective client (possibly per-request
+        // override). Re-resolving pooled here would silently drop override
+        // credentials. `instance` is kept for audit context.
+        let c = client;
         let entity = payload.get("model").and_then(|s| s.as_str()).unwrap_or("");
         if !crate::config::valid_odata_name(entity) {
             return Err(anyhow!("invalid entity name in approval"));
         }
         if !crate::config::entity_allowed(entity) {
-            return Err(anyhow!("entity '{entity}' blocked by SAP_ENTITY_ALLOW/SAP_ENTITY_DENY"));
+            return Err(anyhow!("entity '{entity}' blocked by SAP_ENTITY_ALLOW/SAP_ENTITY_DENY")); 
         }
         let service = payload.get("service").and_then(|s| s.as_str());
         let operation = payload.get("operation").and_then(|s| s.as_str()).unwrap_or("");
@@ -580,6 +626,22 @@ impl Handler {
     }
 }
 
+/// Fingerprint of per-request SAP credential override for approval binding.
+/// Raw secrets never enter the payload (it travels through agent context);
+/// only a sha256 prefix. "none" when no override is used.
+fn auth_fp(args: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let u = args.get("auth_username").and_then(|v| v.as_str()).unwrap_or("");
+    let p = args.get("auth_password").and_then(|v| v.as_str()).unwrap_or("");
+    let t = args.get("auth_token").and_then(|v| v.as_str()).unwrap_or("");
+    if u.is_empty() && p.is_empty() && t.is_empty() {
+        return "none".to_string();
+    }
+    h.update(format!("{u}\u{1f}{p}\u{1f}{t}").as_bytes());
+    format!("ovr-{}", &hex::encode(h.finalize())[..16])
+}
+
 /// Extract one entity's metadata object from parsed $metadata.
 fn entity_meta(md: &Value, entity_set: &str) -> Value {
     let sets = md.get("entity_sets").and_then(|s| s.as_array()).cloned().unwrap_or_default();
@@ -608,35 +670,44 @@ fn key_segment_typed(keys: &Value, types: &HashMap<String, String>) -> anyhow::R
         }
     }
     let fmt = |k: &str, v: &Value| -> String {
+        // String branches are path-encoded AFTER ''-escaping so values with
+        // spaces/slashes/unicode can't break the key predicate path.
+        let qs = |s: &str| crate::config::odata_path_encode(&s.replace('\'', "''"));
         match types.get(k).map(|s| s.as_str()) {
             // Quoted literals.
             Some("String") | Some("Guid") | Some("Date") | Some("DateTime")
             | Some("DateTimeOffset") | Some("Time") | Some("Binary") | Some("Stream") => {
                 match v {
-                    Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-                    _ => format!("'{}'", v.to_string().replace('\'', "''")),
+                    Value::String(s) => format!("'{}'", qs(s)),
+                    _ => format!("'{}'", qs(&v.to_string())),
                 }
             }
-            // Raw numerics / bool.
+            // Raw numerics / bool. String inputs are re-validated: a hostile
+            // "1)/Evil(" string must not pass through raw into the path.
             Some("Boolean") | Some("Byte") | Some("SByte") | Some("Int16")
             | Some("Int32") | Some("Int64") => match v {
-                Value::String(s) => s.clone(),
+                Value::String(s) if s.parse::<i64>().is_ok() || s.parse::<f64>().is_ok() || s == "true" || s == "false" => {
+                    s.clone()
+                }
+                Value::String(s) => format!("'{}'", qs(s)),
                 _ => v.to_string(),
             },
             Some("Decimal") => match v {
-                Value::String(s) => format!("{s}M"),
+                Value::String(s) if s.parse::<f64>().is_ok() => format!("{s}M"),
+                Value::String(s) => format!("'{}'", qs(s)),
                 _ => format!("{}M", v),
             },
             Some("Double") | Some("Single") => match v {
-                Value::String(s) => format!("{s}d"),
+                Value::String(s) if s.parse::<f64>().is_ok() => format!("{s}d"),
+                Value::String(s) => format!("'{}'", qs(s)),
                 _ => format!("{}d", v),
             },
             // Unknown type: heuristic (strings quoted, numbers/bools raw).
             _ => match v {
-                Value::String(s) => format!("'{}'", s.replace('\'', "''")),
+                Value::String(s) => format!("'{}'", qs(s)),
                 Value::Number(n) => n.to_string(),
                 Value::Bool(b) => b.to_string(),
-                _ => format!("'{}'", v.to_string().replace('\'', "''")),
+                _ => format!("'{}'", qs(&v.to_string())),
             },
         }
     };
@@ -723,5 +794,27 @@ mod tests {
         assert!(check_query_caps(None, Some(&(0..60).map(|i| format!("F{i}")).collect::<Vec<_>>().join(",")), None).is_err());
         assert!(check_query_caps(None, None, Some("a,b,c,d,e,f")).is_err());
         assert!(check_query_caps(Some("ID eq '1'"), Some("ID,Name"), Some("Nav")).is_ok());
+    }
+
+    #[test]
+    fn key_values_are_path_safe() {
+        // spaces/slashes/unicode encoded, quotes ''-escaped but literal.
+        assert_eq!(
+            key_segment(&json!({"Name": "a b/cüd"})).unwrap(),
+            "Name='a%20b%2Fc%C3%BCd'"
+        );
+        // hostile numeric strings fall back to quoted form.
+        let mut t = HashMap::new();
+        t.insert("N".into(), "Int32".into());
+        assert_eq!(
+            key_segment_typed(&json!({"N": "1)/Evil("}), &t).unwrap(),
+            "N='1%29%2FEvil%28'"
+        );
+        // auth fingerprint binds override identity without raw secrets.
+        let a = json!({"auth_username": "u", "auth_password": "p"});
+        let b = json!({"auth_username": "u", "auth_password": "other"});
+        assert_ne!(auth_fp(&a), auth_fp(&b));
+        assert_eq!(auth_fp(&json!({})), "none");
+        assert!(!auth_fp(&a).contains('u'));
     }
 }

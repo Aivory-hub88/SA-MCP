@@ -90,8 +90,7 @@ where
 
 impl SapInstanceConfig {
     pub fn is_v4(&self) -> bool {
-        self.odata_version.trim().to_lowercase().starts_with('v') && self.odata_version.contains('4')
-            || self.odata_version.trim() == "4"
+        matches!(self.odata_version.trim().to_lowercase().as_str(), "v4" | "4")
     }
 
     pub fn normalized_url(&self) -> String {
@@ -245,6 +244,23 @@ pub fn auth_override_allowed() -> bool {
 }
 
 /// DoS caps for free-form query strings (ala sap-for-agents MAX_* validation).
+/// Percent-encode a string for use INSIDE an OData path key predicate.
+/// Keeps `'` literal (already `''`-escaped by the caller) and unreserved
+/// chars; everything else (spaces, slashes, unicode) is encoded so key
+/// values can't break out of the path segment.
+pub fn odata_path_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'\'' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 pub const MAX_PAGE_TOP: i64 = 200;
 pub const MAX_FILTER_CHARS: usize = 2000;
 pub const MAX_SELECT_FIELDS: usize = 50;
