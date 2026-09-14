@@ -76,9 +76,15 @@ impl Handler {
         }
     }
 
-    fn on_initialize(&self, _p: &Value) -> Value {
+    fn on_initialize(&self, p: &Value) -> Value {
+        // Version negotiation: echo the client's version when it looks like
+        // a date-based MCP version, else our default. Our wire behavior is
+        // version-independent, so this keeps old and new SDKs (including
+        // Python mcp 2.x / 2026-07-28) interoperable.
+        let want = p.get("protocolVersion").and_then(|v| v.as_str()).unwrap_or("");
+        let ver = if is_version_like(want) { want } else { "2025-11-05" };
         json!({
-            "protocolVersion": "2025-11-05",
+            "protocolVersion": ver,
             "capabilities": {"tools": {"listChanged": false}, "prompts": {"listChanged": false}, "resources": {"listChanged": false}},
             "serverInfo": {"name": self.registry.server_name, "version": env!("CARGO_PKG_VERSION")},
             "instructions": self.registry.instructions,
@@ -756,6 +762,13 @@ fn check_query_caps(filter: Option<&str>, select: Option<&str>, expand: Option<&
         }
     }
     Ok(())
+}
+
+
+/// True for date-shaped MCP protocol versions ("2024-11-05", "2026-07-28").
+fn is_version_like(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10 && b[4] == b'-' && b[7] == b'-' && b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
 }
 
 /// Strip ACL-denied properties from read results.

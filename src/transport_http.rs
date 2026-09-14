@@ -138,13 +138,19 @@ async fn mcp_post(State(st): State<AppState>, headers: HeaderMap, Json(body): Js
         };
         let resp = st.handler.handle(body, &tenant).await;
         let resp = resp.unwrap_or(json!({"jsonrpc":"2.0","id":null,"result":{}}));
+        let negotiated = resp
+            .get("result")
+            .and_then(|r| r.get("protocolVersion"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("2025-11-05")
+            .to_string();
         let session_id = Uuid::new_v4().to_string();
-        insert_session(&st, session_id.clone(), "2025-11-05".into(), tenant);
+        insert_session(&st, session_id.clone(), negotiated.clone(), tenant);
         let (tx, _) = broadcast::channel::<String>(256);
         st.sse_tx.write().unwrap().insert(session_id.clone(), tx);
         return (
             StatusCode::OK,
-            [("MCP-Session-Id", session_id), ("MCP-Protocol-Version", "2025-11-05".to_string())],
+            [("MCP-Session-Id", session_id), ("MCP-Protocol-Version", negotiated)],
             Json(resp),
         )
             .into_response();
